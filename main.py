@@ -1,8 +1,7 @@
-from fastapi import FastAPI
+"""本地启动入口：uv run uvicorn main:app --reload"""
 
-app = FastAPI()
+from metadata_catalog.api import create_app
+from metadata_catalog.store import CatalogStore
 
-
-@app.get("/")
-def read_root():
-    return {"Hello": "World"}
+store = CatalogStore()
+app = create_app(store)
