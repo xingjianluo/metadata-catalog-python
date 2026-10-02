@@ -5,6 +5,8 @@
 
 - 实体登记幂等，非法/冲突登记以可区分原因码拒绝；结构演进只允许"追加字段"等兼容操作。
 - 表级/列级血缘双向展开；环路显式标记不截断；影响分析绑定快照、顺序稳定、可复现。
+- 实体可退役、血缘可撤销：均幂等、只追加不改历史；退役被活跃血缘阻断，
+  撤销后按同一定义重建确定生效；三类拒绝理由（未登记/已退役/无权限）明确区分。
 - 标签/归属发现 + 键集分页，快照钉住，并发写入下翻页不重不漏。
 - 基于管理员/归属/显式授权的可见性；越权返回 `403 permission_denied` 而不是空结果。
 
@@ -32,8 +34,9 @@ main.py           ASGI 入口
 
 ```bash
 uv sync                                   # 安装依赖（含 pytest 开发依赖）
-uv run pytest -v                          # 运行全部测试（36 个用例）
+uv run pytest -v                          # 运行全部测试（50 个用例）
 uv run pytest -s                          # 同时打印每个判定的输入/快照/结论日志
+uv run pytest -s tests/test_retirement_revocation.py   # 只看退役/撤销用例及其判定日志
 uv run python -m compileall metadata_catalog   # 纯编译检查
 ```
 
@@ -71,6 +74,17 @@ curl -s 'http://127.0.0.1:8000/entities/t1/impact?direction=downstream' \
 curl -s -X POST http://127.0.0.1:8000/entities/query \
   -H 'Content-Type: application/json' -H 'X-User: root' -H 'X-User-Admin: true' \
   -d '{"limit":10}'
+
+# 撤销血缘 t1 -> t2（幂等；撤销前的快照结论不受影响）
+curl -s -X POST http://127.0.0.1:8000/lineage/revoke \
+  -H 'Content-Type: application/json' \
+  -d '{"source_entity":"t1","target_entity":"t2","level":"TABLE"}'
+
+# 退役实体（仍有活跃血缘时会被 409 entity_has_active_lineage 拒绝）
+curl -s -X POST http://127.0.0.1:8000/entities/t2/retire
+
+# 退役后直查 => 410 entity_retired（区别于 404 not_found / 403 permission_denied）
+curl -s -i http://127.0.0.1:8000/entities/t2 -H 'X-User: alice'
 ```
 
 ## 关键规则速查
@@ -81,6 +95,10 @@ curl -s -X POST http://127.0.0.1:8000/entities/query \
 | 新增字段 | 仅允许追加在末尾；同名同型幂等，同名异型 → `field_type_conflict` |
 | 删字段 | 仍被列级血缘引用 → `field_in_use_by_lineage` |
 | 改字段类型 | 一律拒绝 `type_change_not_allowed`（改用新增字段） |
+| 实体退役 | 幂等；挂活跃血缘 → `409 entity_has_active_lineage`；退役为终态，不可复活 |
+| 退役后查询 | 直查 → `410 entity_retired`（区别于 `404 not_found` / `403 permission_denied`）；发现与展开均不再包含 |
+| 血缘撤销 | 幂等；撤销前的历史快照结论逐位保留，新快照不再参与展开 |
+| 撤销后重建 | 同一五元组重建**确定生效**，自新快照起再次参与展开 |
 | 血缘环路 | 结果中 `cycles_detected` 显式给出环路径，不截断 |
 | 影响分析 | 响应含 `snapshot_id`；带该 id 重算结论逐位一致 |
 | 越权访问 | `403 permission_denied`（区别于 `404 not_found`） |

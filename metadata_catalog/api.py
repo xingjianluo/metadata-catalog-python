@@ -13,7 +13,13 @@ from fastapi import FastAPI, Header
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from .errors import CatalogError, NotFoundError, PermissionDeniedError
+from .errors import (
+    CatalogError,
+    ConflictError,
+    NotFoundError,
+    PermissionDeniedError,
+    RetiredError,
+)
 from .models import EntityKind, FieldType, LineageLevel, User
 from .service import MetadataCatalog
 
@@ -111,8 +117,12 @@ async def catalog_error_handler(request, exc: CatalogError) -> JSONResponse:
     status = 404
     if isinstance(exc, PermissionDeniedError):
         status = 403
+    elif isinstance(exc, RetiredError):
+        status = 410  # Gone：已退役，与 404/403 明确区分
     elif isinstance(exc, NotFoundError):
         status = 404
+    elif isinstance(exc, ConflictError):
+        status = 409
     elif exc.reason in ("validation_error", "invalid_page_token",
                         "invalid_limit", "missing_user"):
         status = 400
@@ -176,7 +186,22 @@ def add_lineage(body: LineageIn):
         body.source_column, body.target_column, body.transformation,
     )
     return {"edge_id": edge.id, "created": created,
-            "snapshot_id": edge.created_snapshot}
+            "snapshot_id": catalog.store.last_edge_event_snapshot(edge.id)}
+
+
+@app.post("/lineage/revoke")
+def revoke_lineage(body: LineageIn):
+    edge, revoked, snap = catalog.lineage.revoke_lineage(
+        body.source_entity, body.target_entity, body.level,
+        body.source_column, body.target_column,
+    )
+    return {"edge_id": edge.id, "revoked": revoked, "snapshot_id": snap}
+
+
+@app.post("/entities/{entity_id}/retire")
+def retire_entity(entity_id: str):
+    entity, retired, snap = catalog.catalog.retire_entity(entity_id)
+    return {"entity_id": entity.id, "retired": retired, "snapshot_id": snap}
 
 
 @app.get("/entities/{entity_id}/impact")

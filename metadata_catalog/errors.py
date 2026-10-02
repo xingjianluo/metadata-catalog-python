@@ -41,3 +41,17 @@ class LineageError(CatalogError):
     """血缘建立失败。"""
 
     reason = "lineage_error"
+
+
+class RetiredError(CatalogError):
+    """目标实体已退役：与"从未登记"(not_found)、"无权限"(permission_denied)
+    明确区分的第三类拒绝理由。"""
+
+    reason = "entity_retired"
+
+
+class ConflictError(CatalogError):
+    """状态冲突：当前操作与已提交状态矛盾（如退役仍挂活跃血缘的实体），
+    冲突方必须失败且原因码可区分。"""
+
+    reason = "state_conflict"

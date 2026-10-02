@@ -15,7 +15,7 @@
 """
 from __future__ import annotations
 
-from .errors import NotFoundError, PermissionDeniedError
+from .errors import NotFoundError, PermissionDeniedError, RetiredError
 from .models import LineageEdge, User
 from .store import InMemoryStore
 
@@ -69,10 +69,16 @@ class VisibilityService:
 
     def require_read(self, user: User, entity_id: str,
                      snapshot_id: int | None = None) -> int:
-        """校验读权限，返回判定所用快照号；失败抛出可区分异常。"""
+        """校验读权限，返回判定所用快照号；失败抛出可区分异常。
+
+        三类拒绝理由明确区分：从未登记 ``not_found``、已退役
+        ``entity_retired``、存在但未授权 ``permission_denied``。
+        """
         snap = self._snapshot(snapshot_id)
         if self.store.get_entity_at(entity_id, snap) is None:
             raise NotFoundError(f"entity not found: {entity_id!r}")
+        if self.store.is_retired_at(entity_id, snap):
+            raise RetiredError(f"entity retired: {entity_id!r}")
         if not self.can_read(user, entity_id, snap):
             raise PermissionDeniedError(
                 f"user {user.name!r} is not authorized to read "
