@@ -54,9 +54,16 @@ class Entity:
     version: int
     created_snapshot: int
     updated_snapshot: int
+    # 退役发生的快照号；None 表示在役。退役本身也是一个不可变新版本，
+    # 因此历史快照上的实体仍然是在役状态，旧结论可原样复现。
+    retired_snapshot: int | None = None
 
     def field_map(self) -> dict[str, FieldSpec]:
         return {f.name: f for f in self.fields}
+
+    @property
+    def retired(self) -> bool:
+        return self.retired_snapshot is not None
 
 
 @dataclass(frozen=True)

@@ -8,12 +8,21 @@
   邻居按 (实体 id, 列名) 排序后遍历，保证顺序稳定。
 - 循环引用不会被静默截断：遍历时用路径栈检测回到祖先的边，
   在结果中以 ``cycle=True`` 与 ``cycle_path`` 显式标记。
+
+撤销语义（``revoke_lineage``）：
+- 撤销是幂等的状态迁移：重复撤销返回 (边, False)，不报错；
+  撤销从未建立过的边以 ``not_found`` 拒绝（与"已撤销"可区分）。
+- 撤销只影响撤销快照之后的新视图；撤销前的历史快照上该边仍然生效，
+  老结论可逐位复现。
+- 撤销后按同一五元组重建：**算重建生效**——开启一段新的生命周期区间，
+  自重建快照起该边重新参与展开；撤销与重建之间的快照上它确定地不存在。
+  任一快照下边的存在性唯一确定，绝不摇摆。
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .errors import LineageError, NotFoundError
+from .errors import EntityRetiredError, LineageError, NotFoundError
 from .models import LineageEdge, LineageLevel
 from .store import InMemoryStore, SnapshotView
 
@@ -79,15 +88,21 @@ class LineageService:
         with self.store.transaction():
             snap = self.store.current_snapshot()
             view = self.store.view_at(snap)
-            existing_ids = {e.id for e in view.edges}
-            if edge_id in existing_ids:
-                existing = next(e for e in view.edges if e.id == edge_id)
-                return existing, False
+            state, existing = self.store.edge_state_at(edge_id, snap)
+            if state == "active":
+                return existing, False  # 幂等：生效中的重复登记
 
             for eid, col in ((source_entity, source_column),
                              (target_entity, target_column)):
                 entity = view.entities.get(eid)
                 if entity is None:
+                    # 区分"从未登记"与"已退役"两种拒绝理由
+                    committed = self.store.get_entity_at(eid, snap)
+                    if committed is not None and committed.retired:
+                        raise EntityRetiredError(
+                            f"cannot create lineage: entity {eid!r} "
+                            f"is retired"
+                        )
                     raise NotFoundError(
                         f"cannot create lineage: entity not found: {eid!r}"
                     )
@@ -98,6 +113,8 @@ class LineageService:
                         reason="column_not_found",
                     )
 
+            # state == "revoked" 时按同一五元组重建：确定地算重建生效，
+            # 开启新生命周期区间，自新快照起重新参与展开。
             new_snap = self.store.begin()
             edge = LineageEdge(
                 id=edge_id,
@@ -110,6 +127,41 @@ class LineageService:
                 created_snapshot=new_snap,
             )
             self.store.add_edge(new_snap, edge)
+            return edge, True
+
+    # ---------- 撤销 ----------
+    def revoke_lineage(
+        self,
+        source_entity: str,
+        target_entity: str,
+        level: LineageLevel,
+        source_column: str | None = None,
+        target_column: str | None = None,
+    ) -> tuple[LineageEdge, bool]:
+        """撤销一条血缘边。返回 (边, 本次是否发生状态迁移)。
+
+        - 幂等：已撤销时返回 (最近一段生命周期的边, False)；
+        - 从未建立过：``not_found``（与"已撤销"明确区分）；
+        - 成功：关闭当前生命周期区间，自新快照起该边退出展开，
+          历史快照上的结论不变。
+        """
+        if not isinstance(level, LineageLevel):
+            raise LineageError(f"invalid lineage level: {level!r}",
+                               reason="invalid_level")
+        edge_id = LineageEdge.make_id(
+            level, source_entity, source_column, target_entity, target_column
+        )
+        with self.store.transaction():
+            snap = self.store.current_snapshot()
+            state, edge = self.store.edge_state_at(edge_id, snap)
+            if state == "absent":
+                raise NotFoundError(
+                    f"cannot revoke: lineage never registered: {edge_id!r}"
+                )
+            if state == "revoked":
+                return edge, False  # 幂等：重复撤销不改变状态
+            new_snap = self.store.begin()
+            self.store.revoke_edge(new_snap, edge_id)
             return edge, True
 
     # ---------- 邻接构造 ----------
@@ -129,13 +181,22 @@ class LineageService:
                                                  item[0].column or ""))
         return downstream, upstream
 
+    def _require_active_entity(self, entity_id: str, snap: int) -> None:
+        """起点实体校验：未登记 / 已退役给出可区分的拒绝理由。"""
+        if self.store.get_entity_at(entity_id, snap) is None:
+            raise NotFoundError(f"entity not found: {entity_id!r}")
+        view = self.store.view_at(snap)
+        if entity_id not in view.entities:
+            raise EntityRetiredError(
+                f"entity {entity_id!r} is retired at snapshot {snap}"
+            )
+
     def _direct(self, node: NodeRef, neighbors_of: str,
                 snapshot_id: int | None) -> list[NodeRef]:
         snap = self.store.current_snapshot() if snapshot_id is None \
             else snapshot_id
+        self._require_active_entity(node.entity_id, snap)
         view = self.store.view_at(snap)
-        if node.entity_id not in view.entities:
-            raise NotFoundError(f"entity not found: {node.entity_id!r}")
         downstream, upstream = self._adjacency(view)
         table = downstream if neighbors_of == "down" else upstream
         return [n for n, _ in table.get(node, [])]
@@ -159,9 +220,8 @@ class LineageService:
             )
         snap = self.store.current_snapshot() if snapshot_id is None \
             else snapshot_id
+        self._require_active_entity(entity_id, snap)
         view = self.store.view_at(snap)
-        if entity_id not in view.entities:
-            raise NotFoundError(f"entity not found: {entity_id!r}")
         if column is not None and column not in view.entities[entity_id].field_map():
             raise NotFoundError(
                 f"column {column!r} not found on entity {entity_id!r}"

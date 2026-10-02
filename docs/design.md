@@ -4,7 +4,7 @@
 
 | 对象 | 字段 | 说明 |
 |---|---|---|
-| `Entity`（实体） | `id, name, kind, fields, tags, owner, version, created_snapshot, updated_snapshot` | `kind ∈ {TABLE, VIEW, STREAM}`；`fields` 为有序元组；`tags` 为无序集合；所有模型不可变（frozen dataclass）。 |
+| `Entity`（实体） | `id, name, kind, fields, tags, owner, version, created_snapshot, updated_snapshot, retired_snapshot` | `kind ∈ {TABLE, VIEW, STREAM}`；`fields` 为有序元组；`tags` 为无序集合；`retired_snapshot` 非空即已退役；所有模型不可变（frozen dataclass）。 |
 | `FieldSpec`（字段） | `name, type` | `type ∈ {STRING, INTEGER, BOOLEAN, DOUBLE, TIMESTAMP}`。 |
 | `LineageEdge`（血缘边） | `id, level, source_entity/column, target_entity/column, transformation, created_snapshot` | `level ∈ {TABLE, COLUMN}`；`id` 由五元组确定性派生。 |
 | `User`（使用者） | `name, is_admin` | HTTP 场景由 `X-User` / `X-User-Admin` 头给出。 |
@@ -20,8 +20,9 @@
   整体串行化为一个**原子提交**；因此并发提交不会出现半更新状态。
 - 每次提交由单调逻辑时钟分配一个严格递增的**快照号**。
 - 快照视图 `SnapshotView(snapshot_id, entities, edges)` 不可变、惰性构建并缓存：
-  - 实体取"快照号不超过当前快照的最近版本"；
-  - 边只包含 `created_snapshot <= 快照号` 的边，并按边 id 升序排列。
+  - 实体取"快照号不超过当前快照的最近版本"，且**已退役实体不出现在视图中**；
+  - 边按生命周期区间 `[created_snapshot, revoked_snapshot)` 判定，
+    只包含在该快照生效的边，并按边 id 升序排列。
 - 任何分析/查询都可以指定 `snapshot_id`，在旧快照上复现历史结论；
   新提交绝不改变已返回的旧视图。
 
@@ -89,7 +90,53 @@
 - 血缘边仅当其两端实体均可见时才对用户可见，
   用户无法通过血缘关系推断无权实体的存在。
 
-## 5. 发现与分页
+## 5. 退役与撤销
+
+### 实体退役（`POST /entities/{id}/retire`）
+
+| 情况 | 处理 | reason |
+|---|---|---|
+| 实体从未登记 | 拒绝 `404` | `not_found` |
+| 实体仍挂有**未撤销**的血缘边 | 拒绝 `409`，状态不变 | `entity_in_use_by_lineage` |
+| 重复退役（已退役） | 幂等返回当前退役版本，`retired=false`，不产生新快照 | — |
+| 正常退役 | 提交带 `retired_snapshot` 的新版本，`retired=true` | — |
+
+退役生效后的行为：
+
+- 该快照起实体退出快照视图：按标签/归属的发现结果不再包含它，
+  也不再作为上游/下游参与血缘展开；
+- 对已退役实体的变更操作（重登记、加列、删列、以其为端点建血缘、授权）
+  一律拒绝 `410 entity_retired`；
+- 历史快照不受影响：退役前的快照上实体仍在役，旧查询结论逐位可复现。
+
+### 血缘撤销（`POST /lineage/revoke`）
+
+| 情况 | 处理 | reason |
+|---|---|---|
+| 该五元组从未建立过 | 拒绝 `404` | `not_found` |
+| 重复撤销（已撤销） | 幂等返回，`revoked=false`，不产生新快照 | — |
+| 正常撤销 | 关闭当前生命周期区间，`revoked=true` | — |
+
+**撤销后按同一五元组重建：确定地算重建生效。** 存储按生命周期区间
+`[created_snapshot, revoked_snapshot)` 记录每条边；重建开启一段新区间，
+自重建快照起该边重新参与展开，撤销与重建之间的快照上它确定地不存在。
+任一快照下边的存在性唯一确定，绝不出现"一会儿存在一会儿不存在"的摇摆。
+
+### 对历史快照与既有结论的兼容范围
+
+- 退役与撤销都只是**新提交**：任何已返回的快照号上的视图、影响分析、
+  分页结果保持逐位可复现，新旧行为对历史快照零影响。
+- 已退役实体在旧快照上仍可读、仍参与展开；已撤销边在旧快照上仍生效。
+- 拒绝理由三方可区分：从未登记 `404 not_found`、无权限
+  `403 permission_denied`、已退役 `410 entity_retired`。
+  判定顺序固定为存在性 → 权限 → 退役状态，无权用户无法通过原因码
+  探测实体的退役状态。
+- 并发交错（建边/撤边/退役/查询）由同一把锁串行化"检查—判断—写入"：
+  退役与建边冲突时恰有一方成功，失败方以
+  `entity_in_use_by_lineage` 或 `entity_retired` 拒绝；
+  任何快照都不会出现"生效边引用已退役实体"的悬空状态。
+
+## 6. 发现与分页
 
 `POST /entities/query` 支持按标签（任一命中）、归属精确匹配过滤，
 并提供**快照钉住的键集分页**：
@@ -102,14 +149,15 @@
 - token 被篡改 → `invalid_page_token`；token 快照与显式 `snapshot_id` 不一致 →
   `snapshot_mismatch`。
 
-## 6. HTTP 错误码映射
+## 7. HTTP 错误码映射
 
 | 场景 | HTTP 状态 | reason |
 |---|---|---|
 | 参数/请求头非法、token 非法 | 400 | `invalid_*` / `missing_user` |
 | 实体/字段不存在 | 404 | `not_found` |
 | 越权访问 | 403 | `permission_denied` |
-| 标识冲突、演进拒绝、血缘拒绝 | 409 | 对应领域原因码 |
+| 实体已退役 | 410 | `entity_retired` |
+| 标识冲突、演进拒绝、血缘拒绝、退役被血缘阻断 | 409 | 对应领域原因码 |
 
 错误响应体统一为：
 `{"error": <异常类名>, "reason": <原因码>, "message": <描述>}`。

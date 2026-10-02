@@ -16,13 +16,23 @@
   ``field_in_use_by_lineage`` 拒绝；否则删除并推进版本。
 - ``change_field_type``：一律以 ``type_change_not_allowed`` 拒绝，
   调用方应新增字段，避免既有下游按旧类型读取而静默错位。
+
+退役规则（``retire_entity``）：
+- 退役是幂等的状态迁移：重复退役返回 (实体, False)，不报错、不产生新版本。
+- 实体仍挂有**未撤销**的血缘边时，以 ``entity_in_use_by_lineage`` 拒绝，
+  绝不悄悄留下指向已退役实体的悬空关系。
+- 退役产生一个带 ``retired_snapshot`` 的新版本：该快照起实体退出快照视图
+  （发现、血缘展开均不可见），历史快照上的在役状态与旧结论原样保留。
+- 对已退役实体的一切变更操作（重登记/加列/删列）以 ``entity_retired`` 拒绝。
 """
 from __future__ import annotations
 
 from dataclasses import replace
 
 from .errors import (
+    EntityRetiredError,
     NotFoundError,
+    RetirementConflictError,
     SchemaEvolutionError,
     ValidationError,
 )
@@ -66,6 +76,12 @@ class CatalogService:
             snapshot_id = self.store.current_snapshot()
             existing = self.store.get_entity_at(entity_id, snapshot_id)
             if existing is not None:
+                if existing.retired:
+                    # 已退役实体不接受重登记：语义确定，不会"半复活"
+                    raise EntityRetiredError(
+                        f"entity {entity_id!r} is retired; re-registration "
+                        f"is not allowed, use a new identifier"
+                    )
                 # 幂等：定义完全一致才算重复登记
                 same = (
                     existing.name == name
@@ -130,6 +146,10 @@ class CatalogService:
             entity = self.store.get_entity_at(entity_id, snap)
             if entity is None:
                 raise NotFoundError(f"entity not found: {entity_id!r}")
+            if entity.retired:
+                raise EntityRetiredError(
+                    f"entity {entity_id!r} is retired; cannot add fields"
+                )
             current = entity.field_map()
             if field_spec.name in current:
                 if current[field_spec.name].type is field_spec.type:
@@ -156,6 +176,10 @@ class CatalogService:
             entity = self.store.get_entity_at(entity_id, snap)
             if entity is None:
                 raise NotFoundError(f"entity not found: {entity_id!r}")
+            if entity.retired:
+                raise EntityRetiredError(
+                    f"entity {entity_id!r} is retired; cannot drop fields"
+                )
             names = {f.name for f in entity.fields}
             if field_name not in names:
                 raise NotFoundError(
@@ -194,10 +218,51 @@ class CatalogService:
             reason="type_change_not_allowed",
         )
 
+    # ---------- 退役 ----------
+    def retire_entity(self, entity_id: str) -> tuple[Entity, bool]:
+        """退役实体。返回 (实体, 本次是否发生状态迁移)。
+
+        - 幂等：已退役时返回 (当前退役版本, False)，不报错、不产生新版本；
+        - 实体仍挂有未撤销血缘边：``entity_in_use_by_lineage`` 拒绝；
+        - 成功：提交带 ``retired_snapshot`` 的新版本，自该快照起实体
+          退出发现结果与血缘展开，历史快照结论不变。
+        """
+        with self.store.transaction():
+            snap = self.store.current_snapshot()
+            entity = self.store.get_entity_at(entity_id, snap)
+            if entity is None:
+                raise NotFoundError(f"entity not found: {entity_id!r}")
+            if entity.retired:
+                return entity, False  # 幂等：重复退役不改变状态
+            view = self.store.view_at(snap)
+            blocking = sorted(
+                e.id for e in view.edges
+                if e.source_entity == entity_id or e.target_entity == entity_id
+            )
+            if blocking:
+                raise RetirementConflictError(
+                    f"entity {entity_id!r} still has active lineage "
+                    f"{blocking}; revoke lineage before retiring"
+                )
+            new_snap = self.store.begin()
+            retired = replace(
+                entity,
+                version=entity.version + 1,
+                updated_snapshot=new_snap,
+                retired_snapshot=new_snap,
+            )
+            self.store.put_entity(new_snap, retired)
+            return retired, True
+
     def get_entity(self, entity_id: str, snapshot_id: int | None = None) -> Entity:
         snap = snapshot_id if snapshot_id is not None else \
             self.store.current_snapshot()
         entity = self.store.get_entity_at(entity_id, snap)
         if entity is None:
             raise NotFoundError(f"entity not found: {entity_id!r}")
+        if entity.retired:
+            raise EntityRetiredError(
+                f"entity {entity_id!r} was retired at snapshot "
+                f"{entity.retired_snapshot}"
+            )
         return entity

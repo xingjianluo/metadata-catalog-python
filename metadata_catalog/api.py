@@ -13,7 +13,12 @@ from fastapi import FastAPI, Header
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from .errors import CatalogError, NotFoundError, PermissionDeniedError
+from .errors import (
+    CatalogError,
+    EntityRetiredError,
+    NotFoundError,
+    PermissionDeniedError,
+)
 from .models import EntityKind, FieldType, LineageLevel, User
 from .service import MetadataCatalog
 
@@ -48,6 +53,14 @@ class LineageIn(BaseModel):
     transformation: str = "IDENTITY"
 
 
+class RevokeLineageIn(BaseModel):
+    source_entity: str
+    target_entity: str
+    level: LineageLevel
+    source_column: str | None = None
+    target_column: str | None = None
+
+
 class GrantIn(BaseModel):
     user: str
 
@@ -79,6 +92,8 @@ def _entity_dict(entity) -> dict:
         "version": entity.version,
         "created_snapshot": entity.created_snapshot,
         "updated_snapshot": entity.updated_snapshot,
+        "retired": entity.retired,
+        "retired_snapshot": entity.retired_snapshot,
     }
 
 
@@ -111,6 +126,8 @@ async def catalog_error_handler(request, exc: CatalogError) -> JSONResponse:
     status = 404
     if isinstance(exc, PermissionDeniedError):
         status = 403
+    elif isinstance(exc, EntityRetiredError):
+        status = 410  # Gone：已退役，与 404/403 明确区分
     elif isinstance(exc, NotFoundError):
         status = 404
     elif exc.reason in ("validation_error", "invalid_page_token",
@@ -177,6 +194,23 @@ def add_lineage(body: LineageIn):
     )
     return {"edge_id": edge.id, "created": created,
             "snapshot_id": edge.created_snapshot}
+
+
+@app.post("/lineage/revoke")
+def revoke_lineage(body: RevokeLineageIn):
+    edge, revoked = catalog.lineage.revoke_lineage(
+        body.source_entity, body.target_entity, body.level,
+        body.source_column, body.target_column,
+    )
+    return {"edge_id": edge.id, "revoked": revoked,
+            "snapshot_id": catalog.store.current_snapshot()}
+
+
+@app.post("/entities/{entity_id}/retire")
+def retire_entity(entity_id: str):
+    entity, retired = catalog.catalog.retire_entity(entity_id)
+    return {"entity": _entity_dict(entity), "retired": retired,
+            "snapshot_id": entity.updated_snapshot}
 
 
 @app.get("/entities/{entity_id}/impact")

@@ -7,15 +7,18 @@
 4. 被显式逐实体授权的用户，仅可见被授予的实体；
 5. 其余情况不可见。
 
-越权访问的处理原则：``require_read`` 对"不存在"与"存在但无权限"返回
-**不同原因码**（``not_found`` / ``permission_denied``），
+越权访问的处理原则：``require_read`` 对"不存在"、"存在但无权限"、
+"已退役"返回**三种不同原因码**
+（``not_found`` / ``permission_denied`` / ``entity_retired``），
 绝不以"返回空结果"掩盖越权。
+判定顺序固定为：先存在性、再权限、最后退役状态，因此无权用户
+无法通过原因码探测实体的退役状态（对无权者一律 permission_denied）。
 一条血缘仅当其两端实体对该用户均可见时才对该用户可见，
 因此用户不可能通过血缘边推断出无权实体的存在。
 """
 from __future__ import annotations
 
-from .errors import NotFoundError, PermissionDeniedError
+from .errors import EntityRetiredError, NotFoundError, PermissionDeniedError
 from .models import LineageEdge, User
 from .store import InMemoryStore
 
@@ -34,6 +37,10 @@ class VisibilityService:
             if entity is None:
                 raise NotFoundError(
                     f"cannot grant: entity not found: {entity_id!r}"
+                )
+            if entity.retired:
+                raise EntityRetiredError(
+                    f"cannot grant: entity {entity_id!r} is retired"
                 )
             new_snap = self.store.begin()
             self.store.grant(new_snap, user_name, entity_id)
@@ -69,15 +76,25 @@ class VisibilityService:
 
     def require_read(self, user: User, entity_id: str,
                      snapshot_id: int | None = None) -> int:
-        """校验读权限，返回判定所用快照号；失败抛出可区分异常。"""
+        """校验读权限，返回判定所用快照号；失败抛出可区分异常。
+
+        判定顺序：不存在 -> not_found；无权限 -> permission_denied；
+        已退役 -> entity_retired。三者原因码互不混淆。
+        """
         snap = self._snapshot(snapshot_id)
-        if self.store.get_entity_at(entity_id, snap) is None:
+        entity = self.store.get_entity_at(entity_id, snap)
+        if entity is None:
             raise NotFoundError(f"entity not found: {entity_id!r}")
         if not self.can_read(user, entity_id, snap):
             raise PermissionDeniedError(
                 f"user {user.name!r} is not authorized to read "
                 f"entity {entity_id!r}",
                 reason="permission_denied",
+            )
+        if entity.retired:
+            raise EntityRetiredError(
+                f"entity {entity_id!r} was retired at snapshot "
+                f"{entity.retired_snapshot}"
             )
         return snap
 
