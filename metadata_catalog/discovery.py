@@ -70,13 +70,11 @@ class DiscoveryService:
                     else snapshot_id)
             last_id = None
 
+        # 已退役实体由 visible_entities 统一排除（所有入口共用的判定点），
+        # 历史快照上仍按当时状态复现
         visible = self.visibility.visible_entities(user, snap)
-        # 已退役实体不出现在发现结果里（历史快照上仍按当时状态复现）
-        retired = self.store.view_at(snap).retired_entities
         matched_ids = []
         for eid in sorted(visible):
-            if eid in retired:
-                continue
             entity = visible[eid]
             if owner is not None and entity.owner != owner:
                 continue

@@ -90,12 +90,15 @@ def test_retired_get_distinguishes_three_rejection_reasons(svc):
     owner = User("alice")
     stranger = User("bob")
 
-    # 1) 已退役 => entity_retired（owner 与陌生人都一样）
+    # 1) 有权用户查已退役实体 => entity_retired
     with pytest.raises(RetiredError) as exc_retired:
         svc.visibility.require_read(owner, "t1")
     assert exc_retired.value.reason == "entity_retired"
-    with pytest.raises(RetiredError):
+    # 1b) 无权用户查已退役实体 => permission_denied（拒绝优先级：
+    #     先权限后退役，无权者无法借"已退役"理由推断实体存在过）
+    with pytest.raises(PermissionDeniedError) as exc_denied_retired:
         svc.visibility.require_read(stranger, "t1")
+    assert exc_denied_retired.value.reason == "permission_denied"
     # 2) 从未登记 => not_found
     with pytest.raises(NotFoundError) as exc_missing:
         svc.visibility.require_read(owner, "ghost")
@@ -117,7 +120,8 @@ def test_retired_get_distinguishes_three_rejection_reasons(svc):
     log_judgment("retire-distinct-reasons",
                  {"retired": "t1", "missing": "ghost", "denied": "t2"},
                  svc.store.current_snapshot(), "DISTINCT",
-                 "entity_retired / not_found / permission_denied 三分")
+                 "entity_retired / not_found / permission_denied 三分；"
+                 "无权用户查退役实体只得 permission_denied")
 
 
 def test_retire_with_active_lineage_rejected_then_allowed_after_revoke(svc):
