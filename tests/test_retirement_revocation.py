@@ -90,17 +90,20 @@ def test_retired_get_distinguishes_three_rejection_reasons(svc):
     owner = User("alice")
     stranger = User("bob")
 
-    # 1) 已退役 => entity_retired（owner 与陌生人都一样）
+    # 1) 有权读它的人（owner/被授权者/管理员）=> entity_retired
     with pytest.raises(RetiredError) as exc_retired:
         svc.visibility.require_read(owner, "t1")
     assert exc_retired.value.reason == "entity_retired"
-    with pytest.raises(RetiredError):
+    # 2) 无权者查退役实体 => permission_denied（拒绝优先级：权限先于退役，
+    #    无权者无法借 "entity_retired" 探测实体是否登记过）
+    with pytest.raises(PermissionDeniedError) as exc_stranger:
         svc.visibility.require_read(stranger, "t1")
-    # 2) 从未登记 => not_found
+    assert exc_stranger.value.reason == "permission_denied"
+    # 3) 从未登记 => not_found（与是否退役继续区分得开）
     with pytest.raises(NotFoundError) as exc_missing:
         svc.visibility.require_read(owner, "ghost")
     assert exc_missing.value.reason == "not_found"
-    # 3) 存在且未退役但无权限 => permission_denied
+    # 4) 存在且未退役但无权限 => permission_denied
     _table(svc, "t2", owner="alice")
     with pytest.raises(PermissionDeniedError) as exc_denied:
         svc.visibility.require_read(stranger, "t2")
@@ -115,9 +118,11 @@ def test_retired_get_distinguishes_three_rejection_reasons(svc):
     with pytest.raises(NotFoundError):
         svc.catalog.get_entity("ghost")
     log_judgment("retire-distinct-reasons",
-                 {"retired": "t1", "missing": "ghost", "denied": "t2"},
+                 {"retired": "t1", "missing": "ghost", "denied": "t2",
+                  "stranger_on_retired": exc_stranger.value.reason},
                  svc.store.current_snapshot(), "DISTINCT",
-                 "entity_retired / not_found / permission_denied 三分")
+                 "not_found -> permission_denied -> entity_retired 顺序固定；"
+                 "三者原因码两两不同")
 
 
 def test_retire_with_active_lineage_rejected_then_allowed_after_revoke(svc):

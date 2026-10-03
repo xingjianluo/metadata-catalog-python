@@ -7,9 +7,14 @@
 4. 被显式逐实体授权的用户，仅可见被授予的实体；
 5. 其余情况不可见。
 
-越权访问的处理原则：``require_read`` 对"不存在"与"存在但无权限"返回
-**不同原因码**（``not_found`` / ``permission_denied``），
+越权访问的处理原则：``require_read`` 的拒绝优先级固定为
+"不存在"（``not_found``）→ "存在但无权限"（``permission_denied``）→
+"已退役"（``entity_retired``）：``entity_retired`` 只透露给本来就有权
+读该实体的人，无权用户无法借此探测实体是否登记过；三者原因码两两不同，
 绝不以"返回空结果"掩盖越权。
+已退役实体在 ``visible_entities`` 统一剔除（对管理员同样生效），
+因此发现、可见血缘边、带权限的影响分析等所有建立在可见集合上的入口
+都不会再让退役实体出现；对已退役实体发起授权也会被明确拒绝。
 一条血缘仅当其两端实体对该用户均可见时才对该用户可见，
 因此用户不可能通过血缘边推断出无权实体的存在。
 """
@@ -25,7 +30,11 @@ class VisibilityService:
         self.store = store
 
     def grant(self, user_name: str, entity_id: str) -> int:
-        """显式授予某用户对某实体的读权限。"""
+        """显式授予某用户对某实体的读权限。
+
+        退役是终态：对已退役实体授权一律以 ``entity_retired`` 拒绝，
+        不允许通过授权把退役实体重新带回任何可见性结果。
+        """
         if not user_name or not entity_id:
             raise ValueError("user_name and entity_id must be non-empty")
         with self.store.transaction():
@@ -34,6 +43,10 @@ class VisibilityService:
             if entity is None:
                 raise NotFoundError(
                     f"cannot grant: entity not found: {entity_id!r}"
+                )
+            if self.store.is_retired_at(entity_id, snap):
+                raise RetiredError(
+                    f"cannot grant: entity retired: {entity_id!r}"
                 )
             new_snap = self.store.begin()
             self.store.grant(new_snap, user_name, entity_id)
@@ -71,34 +84,46 @@ class VisibilityService:
                      snapshot_id: int | None = None) -> int:
         """校验读权限，返回判定所用快照号；失败抛出可区分异常。
 
-        三类拒绝理由明确区分：从未登记 ``not_found``、已退役
-        ``entity_retired``、存在但未授权 ``permission_denied``。
+        拒绝优先级固定为：从未登记 ``not_found`` → 无权限
+        ``permission_denied`` → 已退役 ``entity_retired``。
+        即"已退役"只透露给本来就有权读该实体的人；无权用户拿到的是
+        与实体是否退役无关的 ``permission_denied``，无法借此探测
+        实体是否存在过。三类理由两两可区分。
         """
         snap = self._snapshot(snapshot_id)
         if self.store.get_entity_at(entity_id, snap) is None:
             raise NotFoundError(f"entity not found: {entity_id!r}")
-        if self.store.is_retired_at(entity_id, snap):
-            raise RetiredError(f"entity retired: {entity_id!r}")
         if not self.can_read(user, entity_id, snap):
             raise PermissionDeniedError(
                 f"user {user.name!r} is not authorized to read "
                 f"entity {entity_id!r}",
                 reason="permission_denied",
             )
+        if self.store.is_retired_at(entity_id, snap):
+            raise RetiredError(f"entity retired: {entity_id!r}")
         return snap
 
     def visible_entities(self, user: User,
                          snapshot_id: int | None = None) -> dict:
-        """返回用户在该快照下可见的实体字典。"""
+        """返回用户在该快照下可见的实体字典。
+
+        已退役实体在此**统一**剔除（对管理员同样生效）：退役是终态，
+        不得通过任何可见性入口（发现、血缘可见边、带权限的影响分析）
+        重新出现；历史快照仍按当时状态复现。
+        """
         snap = self._snapshot(snapshot_id)
         view = self.store.view_at(snap)
+        retired = view.retired_entities
         if user.is_admin:
-            return dict(view.entities)
+            return {eid: e for eid, e in view.entities.items()
+                    if eid not in retired}
         per_entity, owner_readers = self.store.grants_at(snap)
         granted = per_entity.get(user.name, set())
         owner_all = user.name in owner_readers
         result = {}
         for eid, entity in view.entities.items():
+            if eid in retired:
+                continue
             if owner_all or entity.owner == user.name or eid in granted:
                 result[eid] = entity
         return result

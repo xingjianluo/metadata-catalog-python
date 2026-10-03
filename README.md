@@ -6,7 +6,13 @@
 - 实体登记幂等，非法/冲突登记以可区分原因码拒绝；结构演进只允许"追加字段"等兼容操作。
 - 表级/列级血缘双向展开；环路显式标记不截断；影响分析绑定快照、顺序稳定、可复现。
 - 实体可退役、血缘可撤销：均幂等、只追加不改历史；退役被活跃血缘阻断，
-  撤销后按同一定义重建确定生效；三类拒绝理由（未登记/已退役/无权限）明确区分。
+  撤销后按同一定义重建确定生效，但重建与首次创建走同一套端点校验——
+  撤销期间列被删除或实体已退役时，重建以相同原因码拒绝，
+  任何快照都不会出现指向已不存在实体/列的活跃血缘。
+- 退役是终态：已退役实体不能被授权，也不会出现在任何可见性集合与
+  发现结果里（对管理员同样生效）；拒绝优先级固定为
+  未登记(`not_found`) → 无权限(`permission_denied`) → 已退役(`entity_retired`)，
+  无权用户无法借"已退役"探测实体是否登记过。
 - 标签/归属发现 + 键集分页，快照钉住，并发写入下翻页不重不漏。
 - 基于管理员/归属/显式授权的可见性；越权返回 `403 permission_denied` 而不是空结果。
 
@@ -34,9 +40,12 @@ main.py           ASGI 入口
 
 ```bash
 uv sync                                   # 安装依赖（含 pytest 开发依赖）
-uv run pytest -v                          # 运行全部测试（50 个用例）
-uv run pytest -s                          # 同时打印每个判定的输入/快照/结论日志
+uv run pytest -v                          # 运行全部测试（56 个用例）
+uv run pytest -s --log-cli-level=INFO     # 同时打印每个判定的输入/快照/结论日志
 uv run pytest -s tests/test_retirement_revocation.py   # 只看退役/撤销用例及其判定日志
+uv run pytest -s --log-cli-level=INFO tests/test_bugfix_a.py
+#   ↑ 只看本批回归用例：撤销后删列再重建被拒 / 退役终态（不可授权、
+#     不进可见性与发现结果）/ 退役实体拒绝优先级 / 并发交错无悬空引用
 uv run python -m compileall metadata_catalog   # 纯编译检查
 ```
 
@@ -96,12 +105,13 @@ curl -s -i http://127.0.0.1:8000/entities/t2 -H 'X-User: alice'
 | 删字段 | 仍被列级血缘引用 → `field_in_use_by_lineage` |
 | 改字段类型 | 一律拒绝 `type_change_not_allowed`（改用新增字段） |
 | 实体退役 | 幂等；挂活跃血缘 → `409 entity_has_active_lineage`；退役为终态，不可复活 |
-| 退役后查询 | 直查 → `410 entity_retired`（区别于 `404 not_found` / `403 permission_denied`）；发现与展开均不再包含 |
+| 退役后授权 | 一律拒绝 `410 entity_retired`，授权不能让退役实体复活 |
+| 退役后查询 | 有权者直查 → `410 entity_retired`；无权者 → `403 permission_denied`（不泄露"存在过"）；未登记 → `404 not_found`；可见性集合/发现/可见血缘边统一不再包含 |
 | 血缘撤销 | 幂等；撤销前的历史快照结论逐位保留，新快照不再参与展开 |
-| 撤销后重建 | 同一五元组重建**确定生效**，自新快照起再次参与展开 |
+| 撤销后重建 | 同一五元组重建**确定生效**，自新快照起再次参与展开；但重建与首次创建走同一套端点校验——撤销期间列被删（`column_not_found`）或实体已退役（`entity_retired`）时按相同原因码拒绝，任何快照都不会出现指向已不存在实体/列的活跃血缘 |
 | 血缘环路 | 结果中 `cycles_detected` 显式给出环路径，不截断 |
 | 影响分析 | 响应含 `snapshot_id`；带该 id 重算结论逐位一致 |
-| 越权访问 | `403 permission_denied`（区别于 `404 not_found`） |
+| 越权访问 | `403 permission_denied`（区别于 `404 not_found`）；拒绝优先级固定为 `not_found` → `permission_denied` → `entity_retired` |
 | 分页 | token 内嵌快照号；翻页期间的新写入不影响本轮结果 |
 
 详见 [`docs/design.md`](docs/design.md)。

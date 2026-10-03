@@ -20,9 +20,10 @@
 退役（``retire_entity``）：
 - 仍挂活跃血缘的实体拒绝退役（``entity_has_active_lineage``）；
 - 退役幂等、终态：重复退役不报错也不改状态；退役后同 id 的
-  重新登记与字段演进一律以 ``entity_retired`` 拒绝；
-- 已退役实体不再出现在发现结果与血缘展开中；直查返回
-  ``entity_retired``，与 ``not_found`` / ``permission_denied`` 区分。
+  重新登记、字段演进与授权一律以 ``entity_retired`` 拒绝；
+- 已退役实体不再出现在任何可见性集合、发现结果与血缘展开中；
+  直查时有权者得到 ``entity_retired``，无权者得到
+  ``permission_denied``（不泄露"存在过"），两者都与 ``not_found`` 区分。
 """
 from __future__ import annotations
 

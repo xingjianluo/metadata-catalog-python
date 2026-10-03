@@ -6,7 +6,10 @@
 - 重复登记同一五元组且边仍活跃：幂等返回（created=False）。
 - 撤销（``revoke_lineage``）只追加生命周期事件：新快照不再参与展开，
   历史快照结论逐位保留；重复撤销幂等。撤销后按同一五元组重建
-  **确定生效**（自新快照起再次活跃），每个快照各有确定答案。
+  **确定生效**（自新快照起再次活跃），每个快照各有确定答案；
+  但重建与首次创建走同一套端点校验——撤销期间列被删除或实体已退役时，
+  重建以与首次创建相同的原因码拒绝，任何快照都不会出现指向
+  已不存在实体/列的活跃血缘。
 - 已退役实体不可作为建边端点（``entity_retired``），也不参与展开。
 - 向上游/下游展开与影响分析都基于固定快照视图，结果可复现；
   邻居按 (实体 id, 列名) 排序后遍历，保证顺序稳定。
@@ -91,21 +94,21 @@ class LineageService:
                 # 确定且稳定的重建语义：撤销后按同一五元组重建 => 重建生效，
                 # 自新快照起再次参与展开；撤销与重建之间的历史快照
                 # 仍视其为已撤销，结论一字不变。
-                for eid in (source_entity, target_entity):
-                    self._require_active_entity(view, eid)
+                # 重建与首次创建走完全相同的端点校验：撤销期间列可能已被
+                # 删除、实体可能已退役，此时重建必须以与首次创建相同的
+                # 原因码拒绝，绝不留下指向不存在列/实体的活跃边。
+                self._require_endpoints(
+                    view, level, source_entity, source_column,
+                    target_entity, target_column,
+                )
                 new_snap = self.store.begin()
                 self.store.add_edge(new_snap, defined)
                 return defined, True
 
-            for eid, col in ((source_entity, source_column),
-                             (target_entity, target_column)):
-                entity = self._require_active_entity(view, eid)
-                if level is LineageLevel.COLUMN and col not in entity.field_map():
-                    raise LineageError(
-                        f"cannot create lineage: column {col!r} does not exist "
-                        f"on entity {eid!r}",
-                        reason="column_not_found",
-                    )
+            self._require_endpoints(
+                view, level, source_entity, source_column,
+                target_entity, target_column,
+            )
 
             new_snap = self.store.begin()
             edge = LineageEdge(
@@ -120,6 +123,27 @@ class LineageService:
             )
             self.store.add_edge(new_snap, edge)
             return edge, True
+
+    def _require_endpoints(
+        self,
+        view: SnapshotView,
+        level: LineageLevel,
+        source_entity: str,
+        source_column: str | None,
+        target_entity: str,
+        target_column: str | None,
+    ) -> None:
+        """建边/重建共用的端点校验：实体须存在且未退役，
+        列级边还要求两端列在该快照下仍然存在。"""
+        for eid, col in ((source_entity, source_column),
+                         (target_entity, target_column)):
+            entity = self._require_active_entity(view, eid)
+            if level is LineageLevel.COLUMN and col not in entity.field_map():
+                raise LineageError(
+                    f"cannot create lineage: column {col!r} does not exist "
+                    f"on entity {eid!r}",
+                    reason="column_not_found",
+                )
 
     @staticmethod
     def _require_active_entity(view: SnapshotView, entity_id: str):
